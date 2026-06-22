@@ -1,5 +1,25 @@
 # nRF52833
 
+Application firmware: acts as a commandable BLE radio for the MSP430. It receives
+counter values from the MSP430 over the C2C SPI link (SPI slave, `SPIS2`),
+advertises each value over BLE for ~1 s, and reports completion back through a
+status register (see [src/main.c](src/main.c) and the shared
+[protocol.h](../protocol.h)). It never touches the shared LED.
+
+## Build (Makefile)
+
+```bash
+make GNU_INSTALL_ROOT=<gcc-arm-none-eabi>/bin/ release   # high optimization
+make GNU_INSTALL_ROOT=<gcc-arm-none-eabi>/bin/ debug     # no optimization
+make clean
+make flash                                               # program via riotee-probe
+```
+
+`GNU_INSTALL_ROOT` may be omitted if `arm-none-eabi-gcc` is on your `PATH`. The
+Makefile always builds with `-DDISABLE_CAP_MONITOR` (see below) and builds the
+app in [src/](src/) against the `Riotee_SDK` submodule. The sections below
+document the underlying SDK build the Makefile wraps.
+
 ## Toolchain variables
 
 ```bash

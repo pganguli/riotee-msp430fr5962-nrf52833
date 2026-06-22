@@ -1,5 +1,21 @@
 # MSP430FR5962
 
+Application firmware: keeps a power-cycle-persistent counter in FRAM and hands
+each value to the nRF52 over the C2C SPI link for BLE advertising (see
+[main.c](main.c) and the shared [protocol.h](../protocol.h)).
+
+## Build (Makefile)
+
+```bash
+make CCS_ROOT=<path to CCS install> release   # highest optimization
+make CCS_ROOT=<path to CCS install> debug     # no optimization + symbols
+make clean
+make flash                                    # SBW program via riotee-probe
+```
+
+`CCS_ROOT` defaults to `~/ti/ccs2051/ccs`. The sections below document the
+underlying `cl430`/`lnk430`/`hex430` invocations the Makefile wraps.
+
 ## Toolchain variables
 
 Set these before running any of the commands below. Adjust paths to match your
