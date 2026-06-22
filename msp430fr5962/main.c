@@ -22,8 +22,8 @@
  *   - restored value after a power cycle/reset:           3 rapid blinks
  *   - while a value is out for advertising:                LED on
  *   - confirmation received:                               LED off
- *   - 3 s timeout:                                         brief off, then on
- * (retry)
+ *   - 3 s timeout:                                         3 rapid blinks, then
+ * retry
  *
  * All steady-state signal/timer handling is interrupt-driven; the CPU sleeps in
  * LPM3 (or LPM0 during the brief SPI byte shifts) whenever it has nothing to
@@ -200,9 +200,8 @@ int main(void) {
         break;
       }
 
-      /* Timeout: blink off briefly, then retry the same value. */
-      led_off();
-      __delay_cycles(100000); /* ~100 ms */
+      /* Timeout: 3 rapid blinks, then retry the same value. */
+      blink_rapid(3);
     }
   }
 }

@@ -37,7 +37,7 @@ The LED (PJ.0) is driven by the MSP430 only.
 | 30 rapid blinks on boot | First boot after programming — counter reset to 0 |
 | 3 rapid blinks on boot | Counter restored from FRAM after a power cycle |
 | Steady on | Waiting for the nRF52 to finish advertising |
-| Brief off, then on | 3 s timeout — retrying the same counter value |
+| 3 rapid blinks | 3 s timeout — retrying the same counter value |
 | Brief off between steady-on periods | Counter committed, moving to next value |
 
 ## Scanning
