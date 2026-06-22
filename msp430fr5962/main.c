@@ -18,8 +18,8 @@
  *
  * LED feedback (PJ.0, shared with the nRF52 - the nRF52 firmware must leave it
  * alone):
- *   - first boot after programming (counter initialised): 3 slow blinks
- *   - restored value after a power cycle/reset:            3 rapid blinks
+ *   - first boot after programming (counter reset to 0): 30 rapid blinks
+ *   - restored value after a power cycle/reset:           3 rapid blinks
  *   - while a value is out for advertising:                LED on
  *   - confirmation received:                               LED off
  *   - 3 s timeout:                                         brief off, then on
