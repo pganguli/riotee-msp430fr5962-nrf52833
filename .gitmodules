@@ -1,0 +1,3 @@
+[submodule "Riotee_SDK"]
+	path = Riotee_SDK
+	url = git@github.com:NessieCircuits/Riotee_SDK.git
