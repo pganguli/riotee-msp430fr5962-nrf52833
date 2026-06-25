@@ -1,3 +1,6 @@
-[submodule "Riotee_SDK"]
+[submodule "nrf52833/Riotee_SDK"]
 	path = nrf52833/Riotee_SDK
 	url = git@github.com:NessieCircuits/Riotee_SDK.git
+[submodule "nrf52833/bonito"]
+	path = nrf52833/bonito
+	url = git@github.com:geissdoerfer/bonito.git
