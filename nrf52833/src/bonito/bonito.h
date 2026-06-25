@@ -4,25 +4,27 @@
 /*
  * Bonito connection-interval engine — C port of neslab/bonito protocols.py.
  *
- * One-way (always-on peer) variant:
- *   Because the laptop is always-on, its charging-time CDF is identically 1.
- *   The inverse JOINT CDF of (node_dist, always_on) at probability p therefore
- *   reduces to node_dist.ppf(p).  No back-channel is needed.
- *
  * Per-round usage (mirrors protocols.py:20-28 order — critical):
  *
- *   float c  = charge_source_next();          // get this round's charging time
- *   float ci = bonito_connection_interval(&dist, p);  // use CURRENT model
- *   bool  ok = (c <= ci);                     // success check
- *   build_and_send_advert(seq, ci, payload);  // announce ci
- *   bonito_dist_sgd_update(&dist, c);         // update model AFTER using it
- *   rendezvous_wait(ci);                      // sleep until next round
+ *   float c  = charge_source_next();
+ *   float ci = bonito_connection_interval(&dist, NULL, p);  // always-on peer
+ *   build_advert(seq, BONITO_MODEL_NORMAL, dist.mean, dist.var, app);
+ *   bonito_dist_sgd_update(&dist, c);
+ *   rendezvous_wait(ci);
  *
- * Extension point: to support a real two-distribution joint CDF (symmetric
- * Bonito with a second harvesting node), replace the body of
- * bonito_connection_interval() with a bisection root-finder over
- *   f(x) = dist1.cdf(x) * dist2.cdf(x) - p
- * ported from bisection.py:16-57.  The caller signature is unchanged.
+ * Always-on peer (current single-node setup):
+ *   Pass peer_dist = NULL.  CI = self.ppf(p).  Paper §7 confirms this is the
+ *   correct degenerate case: when the peer's charging-time CDF ≡ 1, the inverse
+ *   joint CDF reduces to the node's own ppf(p).
+ *
+ * Two-node symmetric Bonito (future, >= 2 intermittent nodes):
+ *   Pass peer_dist = &received_model (populated from the peer's advertisement).
+ *   CI is found by bisecting f(t) = F_self(t) * F_peer(t) − p = 0.
+ *   Both nodes exchange model_type + mean + var in each BLE advertisement
+ *   (paper Fig. 12) and independently arrive at the same CI.
+ *
+ * Wire format note: the CI itself is NOT advertised.  Each peer recomputes it
+ * locally from the received model parameters.  See bonito_payload.h.
  */
 
 #include "bonito_dist.h"
@@ -31,11 +33,17 @@
 #define BONITO_TARGET_PROB 0.99f
 
 /*
- * Compute the connection interval (seconds) from the current distribution
- * at target probability p.
+ * Compute the connection interval (seconds).
  *
- * For the one-way / always-on peer case this is simply dist->ppf(p).
+ *   self      — node's own current charging-time distribution
+ *   peer_dist — peer's distribution as received from the last advertisement.
+ *               Pass NULL when the peer is always-on (one-way Bonito).
+ *   p         — target success probability (typically BONITO_TARGET_PROB)
+ *
+ * Returns: CI in seconds (before the caller's min/max clamp).
  */
-float bonito_connection_interval(const bonito_dist_t* dist, float p);
+float bonito_connection_interval(const bonito_dist_t *self,
+                                 const bonito_dist_t *peer_dist,
+                                 float p);
 
 #endif /* BONITO_H */

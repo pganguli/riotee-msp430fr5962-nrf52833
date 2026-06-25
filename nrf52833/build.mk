@@ -6,11 +6,12 @@ PRJ_ROOT   := .
 OUTPUT_DIR := _build
 
 # Select the charging-time source and rendezvous implementation:
-#   sim  (default) — replay the deterministic trace from charge_trace.h;
-#                    compile with -DDISABLE_CAP_MONITOR for constant USB power.
-#   real           — measure real capacitor charging time via the AM1805 RTC;
-#                    remove -DDISABLE_CAP_MONITOR before deploying.
-BONITO_SOURCE ?= sim
+#   real (default) — measure real capacitor charging time via the AM1805 RTC.
+#   sim            — replay the deterministic trace from charge_trace.h.
+#                    -DDISABLE_CAP_MONITOR is added automatically in sim mode
+#                    (required for constant USB/bench power; without it startup
+#                    blocks waiting for a capacitor voltage that never rises).
+BONITO_SOURCE ?= real
 
 ifeq ($(BONITO_SOURCE),sim)
   CHARGE_SOURCE_FILE := $(PRJ_ROOT)/src/charge_source_sim.c
@@ -19,6 +20,7 @@ ifeq ($(BONITO_SOURCE),sim)
 else ifeq ($(BONITO_SOURCE),real)
   CHARGE_SOURCE_FILE := $(PRJ_ROOT)/src/charge_source_real.c
   RENDEZVOUS_FILE    := $(PRJ_ROOT)/src/rendezvous_real.c
+  USER_DEFINES       += -DBONITO_REAL
 else
   $(error BONITO_SOURCE must be 'sim' or 'real', got '$(BONITO_SOURCE)')
 endif

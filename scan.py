@@ -15,6 +15,8 @@ Usage:
     sudo ./scan.py
 """
 
+import argparse
+import datetime
 import math
 import socket
 import struct
@@ -43,11 +45,12 @@ BONITO_ETA = 0.01  # SGD learning rate
 CI_REL_TOL = 0.05  # 5% relative tolerance (generous for float32 vs float64)
 
 # Advert payload layout (must match nrf52833/src/bonito_payload.h):
-#   [seq:u16][ci_ms:u32][app_len:u8][app:N bytes]  total 16 bytes
+#   [seq:u16][model_type:u8][app_len:u8][mean:f32][var:f32][app:4 bytes]
 # Budget: ble.c payload[31] = 3(flags)+2(name-hdr)+6("RIOTEE")+4(mfr-hdr)+data
-# → data ≤ 16 bytes = BONITO_ADV_HDR_LEN(7) + BONITO_ADV_APP_MAX(9).
-BONITO_ADV_HDR_LEN = 7
-BONITO_ADV_APP_MAX = 9
+# → data ≤ 16 bytes = BONITO_ADV_HDR_LEN(12) + BONITO_ADV_APP_MAX(4).
+BONITO_MODEL_NORMAL = 0x01
+BONITO_ADV_HDR_LEN = 12   # seq(2)+model_type(1)+app_len(1)+mean(4)+var(4)
+BONITO_ADV_APP_MAX = 4
 BONITO_ADV_TOTAL = BONITO_ADV_HDR_LEN + BONITO_ADV_APP_MAX  # = 16
 
 # ── Charging-time trace (shared with nrf52833/src/charge_trace.h) ─────────────
@@ -384,6 +387,14 @@ class BonitoRef:
         self._mean += self._eta * diff
         self._var += self._eta * (diff * diff - self._var)
 
+    @property
+    def mean(self) -> float:
+        return self._mean
+
+    @property
+    def sigma(self) -> float:
+        return math.sqrt(max(self._var, 0.0))
+
     def reference_ci_for_seq(self, seq: int) -> float:
         """
         Return the CI (seconds) the node should have computed for this seq,
@@ -408,6 +419,87 @@ class BonitoRef:
 
         return ci
 
+    def ci_for_seq_peek(self, seq: int) -> float:
+        """Return CI for seq without advancing the model (for missed-round display)."""
+        # Temporarily replay up to seq without mutation.
+        mean, var, ref_seq = self._mean, self._var, self._ref_seq
+        while ref_seq < seq:
+            c = CHARGE_TRACE[ref_seq % len(CHARGE_TRACE)]
+            diff = c - mean
+            mean += self._eta * diff
+            var += self._eta * (diff * diff - var)
+            ref_seq += 1
+        return mean + math.sqrt(max(var, 0.0)) * _probit(BONITO_TARGET_PROB)
+
+
+# ── Laptop-side Bonito peer (stable / always-on) ─────────────────────────────
+#
+# The laptop is modelled as a node with a constant charging time equal to its
+# own CI — i.e. it always wakes up exactly on schedule.  Practically its
+# distribution converges to a very tight Normal(mean≈CI, var≈0) and its ppf
+# contribution to the joint CI is negligible, so the joint CI ≈ node CI.  We
+# simulate it anyway so the debug output shows both sides of the protocol.
+
+
+class LaptopPeer:
+    """
+    Bonito NormalDistribution for the stable laptop peer.
+
+    The laptop is always-on, so its charging time each round is effectively 0
+    (it never needs to wait for energy).  Feeding 0.0 into the SGD drives
+    mean → 0 and var → 0, giving ppf(0.99) → 0.  The joint CI is therefore
+    always dominated by the node, which is the correct Bonito behaviour for an
+    always-on peer.
+    """
+
+    def __init__(self) -> None:
+        self._mean = BONITO_INIT_MEAN
+        self._var = BONITO_INIT_VAR
+        self._eta = BONITO_ETA
+
+    @property
+    def mean(self) -> float:
+        return self._mean
+
+    @property
+    def sigma(self) -> float:
+        return math.sqrt(max(self._var, 0.0))
+
+    def ppf(self, p: float) -> float:
+        return self._mean + self.sigma * _probit(p)
+
+    def update(self) -> None:
+        """Always-on: charging time is 0 every round."""
+        diff = 0.0 - self._mean
+        self._mean += self._eta * diff
+        self._var += self._eta * (diff * diff - self._var)
+
+    def joint_ci(
+        self, node_mean: float, node_sigma: float, p: float = BONITO_TARGET_PROB
+    ) -> float:
+        """
+        Bisect for t where F_laptop(t) * F_node(t) = p.
+
+        Both distributions are Normal; scipy.stats.norm.cdf gives the CDF.
+        For an always-on laptop this converges to node.ppf(p) as the laptop's
+        sigma → 0.
+        """
+        from scipy.stats import norm as _norm
+
+        def _joint_cdf(t: float) -> float:
+            lz = (t - self._mean) / max(self.sigma, 1e-9)
+            nz = (t - node_mean) / max(node_sigma, 1e-9)
+            return float(_norm.cdf(lz)) * float(_norm.cdf(nz))
+
+        lo, hi = 0.0, 60.0
+        for _ in range(48):
+            mid = (lo + hi) / 2.0
+            if _joint_cdf(mid) < p:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2.0
+
 
 # ── Advertisement callback ────────────────────────────────────────────────────
 
@@ -415,11 +507,32 @@ class BonitoRef:
 class BonitoScanner:
     """Decodes Bonito advertisements, verifies CI, detects gaps."""
 
-    def __init__(self) -> None:
+    def __init__(self, real: bool = False) -> None:
+        self._real = real  # True → skip CHARGE_TRACE CI verification
         self._last_seq: int | None = None
         self._ref = BonitoRef()
-        self._rx = 0   # rounds received since first packet
-        self._exp = 0  # rounds expected since first packet
+        self._laptop = LaptopPeer()
+        self._rx = 0  # rounds received this session
+        self._exp = 0  # rounds expected this session
+        self._session: int = 0  # reboot counter
+        self._round: int = 0  # round within current session
+        self._session_start: datetime.datetime | None = None
+        self._session_first_ci: int | None = None
+        self._prev_ci_ms: int | None = None
+        self._last_rx_time: datetime.datetime | None = None
+
+    def _reset_session(self) -> None:
+        self._ref = BonitoRef()
+        self._laptop = LaptopPeer()  # laptop peer resets with each node session
+        self._rx = 0
+        self._exp = 0
+        self._session += 1
+        self._round = 0
+        self._session_start = datetime.datetime.now()
+        self._session_first_ci = None
+        self._prev_ci_ms = None
+        self._last_seq = None
+        self._last_rx_time = None
 
     def on_properties_changed(
         self,
@@ -438,28 +551,99 @@ class BonitoScanner:
             return
 
         data = bytes(raw)
-
-        seq, ci_ms, app_len = struct.unpack_from("<HIB", data, 0)
-
-        # Deduplicate: the nRF52 sends 16× ADV_CH_ALL per round.
-        if seq == self._last_seq:
+        # Decode model parameters from the wire (paper Fig. 12 format).
+        # The CI is not transmitted — compute it locally from mean + var.
+        seq, model_type, app_len, mean, var = struct.unpack_from("<HBBff", data, 0)
+        if model_type != BONITO_MODEL_NORMAL:
+            print(f"  ?? unknown model_type=0x{model_type:02x}, skipping")
             return
+        node_sigma = math.sqrt(max(var, 0.0))
+        node_ci_s = mean + node_sigma * _probit(BONITO_TARGET_PROB)
+        node_ci_s = max(0.1, min(30.0, node_ci_s))  # mirror node's clamp
+        ci_ms = int(node_ci_s * 1000)
 
-        # Gap detection (seq wraps at 2^16).
+        now = datetime.datetime.now()
+
+        # Deduplicate burst packets: the nRF52 sends 3× ADV_CH_ALL per round,
+        # all with the same seq. Packets within the same burst arrive within
+        # ~5 ms of each other. If the same seq appears after >0.5 s the node
+        # rebooted and seq restarted at the same value — checkpoint is a no-op
+        # so every boot resets seq to 0. Treat that as a reboot, not a dup.
+        if seq == self._last_seq:
+            if (self._last_rx_time is None or
+                    (now - self._last_rx_time).total_seconds() < 0.5):
+                return
+            # Same seq after long gap → reboot with seq reset to same value.
+            if self._session_start is not None:
+                elapsed = (now - self._session_start).total_seconds()
+                ci_range = (
+                    f"  ci {self._session_first_ci}→{self._prev_ci_ms} ms"
+                    if self._session_first_ci is not None else ""
+                )
+                print(
+                    f"  ** node rebooted  seq {self._last_seq}→{seq}"
+                    f"  session #{self._session}: {self._round} rounds"
+                    f" in {elapsed:.0f}s"
+                    f"  loss={100*(1-self._rx/max(self._exp,1)):.1f}%"
+                    f"{ci_range}"
+                )
+            self._reset_session()
+
+        # ── First packet ever ────────────────────────────────────────────────
+        if self._session_start is None:
+            self._session_start = now
+            resuming = f"  (joining mid-session, seq={seq})" if seq > 0 else ""
+            rssi0 = changed.get("RSSI")
+            rssi0_str = f"  rssi={int(rssi0)} dBm" if rssi0 is not None else ""
+            print(f"[FOUND] Riotee node responding{rssi0_str}{resuming}")
+
+        # ── Gap / reboot detection (seq wraps at 2^16) ───────────────────────
         if self._last_seq is not None:
             delta = (seq - self._last_seq) % 0x10000
-            if delta > 1:
+            if delta > 0x8000:
+                # Backward seq jump → node rebooted.
+                elapsed = (now - self._session_start).total_seconds()
+                ci_range = (
+                    f"  ci {self._session_first_ci}→{self._prev_ci_ms} ms"
+                    if self._session_first_ci is not None
+                    else ""
+                )
+                print(
+                    f"  ** node rebooted  seq {self._last_seq}→{seq}"
+                    f"  session #{self._session}: {self._round} rounds"
+                    f" in {elapsed:.0f}s  loss={100 * (1 - self._rx / max(self._exp, 1)):.1f}%"
+                    f"{ci_range}"
+                )
+                self._reset_session()
+                delta = seq + 1
+            if delta > 1 and self._last_seq is not None:
                 missed = delta - 1
                 end = (self._last_seq + delta - 1) % 0x10000
-                print(f"  !! missed {missed} round(s): seq {self._last_seq + 1}..{end}")
+                if self._real:
+                    ci_hint = ""
+                else:
+                    missed_cis = []
+                    for s in range(self._last_seq + 1, self._last_seq + 1 + min(missed, 5)):
+                        missed_cis.append(
+                            f"{self._ref.ci_for_seq_peek(s % 0x10000) * 1000:.0f}"
+                        )
+                    ci_hint = (
+                        "  expected ci: "
+                        + "/".join(missed_cis)
+                        + (" ms" if len(missed_cis) == missed else f"… ms ({missed} total)")
+                    )
+                print(
+                    f"  !! missed {missed} round(s): seq {self._last_seq + 1}..{end}{ci_hint}"
+                )
             self._exp += delta
         else:
-            self._exp += 1  # first packet counts as 1 expected
+            self._exp += seq + 1
         self._rx += 1
+        self._round += 1
 
         loss_pct = 100.0 * (1.0 - self._rx / self._exp)
 
-        # Decode app payload.
+        # ── Decode app payload ───────────────────────────────────────────────
         app_bytes = data[
             BONITO_ADV_HDR_LEN : BONITO_ADV_HDR_LEN + min(app_len, BONITO_ADV_APP_MAX)
         ]
@@ -469,25 +653,76 @@ class BonitoScanner:
         else:
             app_str = f"app={app_bytes.hex()}"
 
-        # Verify CI against the reference model.
-        ref_ci_s = self._ref.reference_ci_for_seq(seq)
-        node_ci_s = ci_ms / 1000.0
-        rel_err = abs(node_ci_s - ref_ci_s) / max(ref_ci_s, 1e-9)
-        match_str = (
-            "ok" if rel_err <= CI_REL_TOL else f"MISMATCH ref={ref_ci_s * 1000:.0f}ms"
-        )
+        # ── CI verification ──────────────────────────────────────────────────
+        # node_ci_s is derived from received mean+var (computed above).
+        # In sim mode, compare against the reference model replaying the same
+        # synthetic trace; in real mode there is no ground-truth trace.
+        ref_ci_s = self._ref.reference_ci_for_seq(seq)  # advances ref always
+        if self._real:
+            match_str = "real"
+        else:
+            rel_err = abs(node_ci_s - ref_ci_s) / max(ref_ci_s, 1e-9)
+            match_str = (
+                "ok"
+                if rel_err <= CI_REL_TOL
+                else f"MISMATCH ref={ref_ci_s * 1000:.0f}ms"
+            )
+
+        # ── CI trend ─────────────────────────────────────────────────────────
+        if self._prev_ci_ms is None:
+            trend = " "
+        elif ci_ms < self._prev_ci_ms - 1:
+            trend = "↓"
+        elif ci_ms > self._prev_ci_ms + 1:
+            trend = "↑"
+        else:
+            trend = "→"
+        if self._session_first_ci is None:
+            self._session_first_ci = ci_ms
+
+        # ── Next TX window ───────────────────────────────────────────────────
+        next_tx = now + datetime.timedelta(milliseconds=ci_ms)
+        next_tx_str = next_tx.strftime("%H:%M:%S")
 
         rssi = changed.get("RSSI")
         rssi_str = f"  rssi={int(rssi)} dBm" if rssi is not None else ""
 
-        print(f"seq={seq:5d}  ci={ci_ms:6d} ms [{match_str}]  loss={loss_pct:4.1f}%  {app_str}{rssi_str}")
+        # ── Laptop peer update + joint CI ────────────────────────────────────
+        self._laptop.update()
+        joint_ci_ms = int(self._laptop.joint_ci(mean, node_sigma) * 1000)
+
+        # ── Main line ────────────────────────────────────────────────────────
+        print(
+            f"seq={seq:5d}  ci={ci_ms:6d} ms {trend} [{match_str}]"
+            f"  loss={loss_pct:4.1f}%  {app_str}{rssi_str}"
+        )
+        # ── Debug line ───────────────────────────────────────────────────────
+        print(
+            f"       session #{self._session} round {self._round:4d}"
+            f"  next TX ~{next_tx_str} (+{ci_ms} ms)"
+            f"  node µ={mean:.3f}s σ={node_sigma:.3f}s"
+            f"  laptop µ={self._laptop.mean:.3f}s σ={self._laptop.sigma:.3f}s"
+            f"  joint CI={joint_ci_ms} ms"
+        )
+
+        self._prev_ci_ms = ci_ms
         self._last_seq = seq
+        self._last_rx_time = now
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Riotee Bonito BLE monitor")
+    parser.add_argument(
+        "--sim",
+        action="store_true",
+        help="Firmware was built with BONITO_SOURCE=sim (enables synthetic-trace CI verification)",
+    )
+    args = parser.parse_args()
+    real = not args.sim
+
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
 
@@ -504,7 +739,7 @@ def main() -> None:
         }
     )
 
-    scanner = BonitoScanner()
+    scanner = BonitoScanner(real=real)
     bus.add_signal_receiver(
         scanner.on_properties_changed,
         dbus_interface="org.freedesktop.DBus.Properties",

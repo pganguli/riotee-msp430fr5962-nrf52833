@@ -10,10 +10,12 @@
  *
  *   2. Each Bonito round:
  *        a. Get the current-round charging time c (sim: trace; real: cap
- * meter). b. Compute the connection interval CI = dist.ppf(0.99) from the
- *           CURRENT model — this is what the node announces this round.
- *        c. Build the BLE advert payload {seq, ci_ms, app_len, app[]} and
- *           transmit it (3× ADV_CH_ALL for reliability).
+ * meter). b. Compute the connection interval CI from the CURRENT model.
+ *           Always-on peer: CI = dist.ppf(0.99).
+ *           Two intermittent nodes (future): CI = bisect(joint CDF = 0.99).
+ *        c. Build the BLE advert payload {seq, model_type, app_len, mean,
+ *           var, app[]} per paper Fig. 12 and transmit (3× ADV_CH_ALL).
+ *           The peer recomputes CI locally from the received mean + var.
  *        d. Update the distribution model: dist.sgd_update(c).
  *        e. Sleep for CI (sim: riotee_sleep_ms; real: AM1805 alarm +
  * powerdown).
@@ -21,10 +23,11 @@
  * The order (compute-CI → advertise → sgd_update) matches protocols.py:20-28
  * exactly — critical for the laptop-side CI verifier in scan.py to agree.
  *
- * Always-on peer simplification:
- *   The laptop's charging-time CDF is identically 1, so the joint CDF
- *   degenerates and CI = node.ppf(p). No back-channel is needed. The node
- *   announces its own CI in every advertisement.
+ * Always-on peer (current setup, paper §7):
+ *   The laptop's charging-time CDF ≡ 1, so the inverse joint CDF degenerates
+ *   to node.ppf(p).  bonito_connection_interval() accepts a NULL peer_dist to
+ *   express this.  For two intermittent nodes, pass the peer's model instead
+ *   (received from its advertisement) and the bisection path activates.
  *
  * This firmware NEVER touches PIN_LED_CTRL (P0.03): the LED is shared with the
  * MSP430, which owns it.
@@ -58,6 +61,9 @@
 #include "riotee_ble.h"
 #include "riotee_gpio.h"
 #include "riotee_timing.h"
+#ifdef BONITO_REAL
+#include "riotee_am1805.h"
+#endif
 
 /* ── BLE identity ─────────────────────────────────────────────────────────────
  */
@@ -165,6 +171,9 @@ void SPIM2_SPIS2_SPI2_IRQHandler(void) {
 void lateinit(void) {
   riotee_ble_init();
   spis_init();
+#ifdef BONITO_REAL
+  riotee_am1805_init();
+#endif
   /* Deliberately do NOT configure PIN_LED_CTRL — the MSP430 owns the LED. */
 }
 
@@ -199,7 +208,7 @@ int main(void) {
   adv_cfg.name            = adv_name;
   adv_cfg.name_len        = sizeof(adv_name) - 1; /* 6, excludes NUL */
   adv_cfg.data            = &adv_payload;
-  adv_cfg.data_len        = sizeof(adv_payload);  /* BONITO_ADV_HDR_LEN + BONITO_ADV_APP_MAX = 16 */
+  adv_cfg.data_len        = sizeof(adv_payload);  /* BONITO_ADV_HDR_LEN(12) + BONITO_ADV_APP_MAX(4) = 16 */
   adv_cfg.manufacturer_id = RIOTEE_BLE_ADV_MNF_NORDIC;
   riotee_ble_adv_cfg(&adv_cfg);
 
@@ -207,6 +216,12 @@ int main(void) {
     /* ── Wait for a payload from the MSP430 ─────────────────────────────── */
     while (!g_new_payload) enter_low_power();
     g_new_payload = false;
+
+    /* Checkpoint dist + seq to FRAM.  Called right after sleep (cap recharged)
+     * and before BLE TX (the main energy draw), so the FRAM write has a full
+     * energy budget.  On a brownout the next boot restores here and replays
+     * the round using the same g_app_buf that was checkpointed. */
+    riotee_checkpoint();
 
     /* Snapshot payload atomically (ISR may overwrite any time). */
     local_app_len = g_app_len;
@@ -218,37 +233,31 @@ int main(void) {
     /* a) Charging time observation for this round. */
     c = charge_source_next();
 
-    /* b) Connection interval from the CURRENT model (before SGD update). */
-    ci = bonito_connection_interval(&dist, BONITO_TARGET_PROB);
+    /* b) Connection interval from the CURRENT model (before SGD update).
+     *
+     * NULL peer → always-on laptop (paper §7 degenerate case).
+     * Replace NULL with &peer_dist when a second intermittent node's model
+     * is available (received from its BLE advertisement). */
+    ci = bonito_connection_interval(&dist, NULL, BONITO_TARGET_PROB);
 
     /* Clamp CI to a sane range: at least 100 ms, at most 30 s. */
     if (ci < 0.1f) ci = 0.1f;
     if (ci > 30.0f) ci = 30.0f;
 
-    /* c) Build and transmit the advertisement.
-     * Clip app payload to the advert budget; C2C can carry more (16 B) than
-     * fits in the BLE manufacturer-data field (9 B). */
-    adv_payload.seq    = seq;
-    adv_payload.ci_ms  = (uint32_t)(ci * 1000.0f);
+    /* c) Build and transmit the advertisement (paper Fig. 12 format).
+     * Advertise the raw model parameters (mean, var) so the peer can
+     * independently recompute the CI.  Clip app payload to the advert budget;
+     * C2C can carry more (16 B) than fits in the BLE field (4 B). */
+    adv_payload.seq        = seq;
+    adv_payload.model_type = BONITO_MODEL_NORMAL;
+    adv_payload.mean       = dist.mean;
+    adv_payload.var        = dist.var;
     adv_payload.app_len = (local_app_len <= BONITO_ADV_APP_MAX)
                               ? local_app_len : (uint8_t)BONITO_ADV_APP_MAX;
     memset(adv_payload.app, 0, sizeof(adv_payload.app));
     memcpy(adv_payload.app, local_app, adv_payload.app_len);
 
-    /* 16 bursts on all channels → 48 packets total. */
-    riotee_ble_advertise(ADV_CH_ALL);
-    riotee_ble_advertise(ADV_CH_ALL);
-    riotee_ble_advertise(ADV_CH_ALL);
-    riotee_ble_advertise(ADV_CH_ALL);
-    riotee_ble_advertise(ADV_CH_ALL);
-    riotee_ble_advertise(ADV_CH_ALL);
-    riotee_ble_advertise(ADV_CH_ALL);
-    riotee_ble_advertise(ADV_CH_ALL);
-    riotee_ble_advertise(ADV_CH_ALL);
-    riotee_ble_advertise(ADV_CH_ALL);
-    riotee_ble_advertise(ADV_CH_ALL);
-    riotee_ble_advertise(ADV_CH_ALL);
-    riotee_ble_advertise(ADV_CH_ALL);
+    /* 3 bursts on all channels → 9 packets total. */
     riotee_ble_advertise(ADV_CH_ALL);
     riotee_ble_advertise(ADV_CH_ALL);
     riotee_ble_advertise(ADV_CH_ALL);
@@ -257,6 +266,13 @@ int main(void) {
     bonito_dist_sgd_update(&dist, c);
 
     seq++;
+
+    /* Give the MSP430 time to poll ACCEPTED and commit g_counter to FRAM
+     * before disable_power is called.  The MSP430 polls every ~100 ms; 200 ms
+     * covers at least one full poll cycle regardless of phase alignment.
+     * The nRF52 is idle (radio off) here so the cap charges rather than
+     * drains — negligible energy cost at 2 V / 30 mA PSU. */
+    riotee_sleep_ms(200);
 
     /* e) Sleep until the next connection interval. */
     rendezvous_wait(ci);

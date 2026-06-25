@@ -1,42 +1,46 @@
 /*
  * Real energy-harvesting charging-time source (BONITO_SOURCE=real).
  *
- * ── STUB — NOT YET IMPLEMENTED ──────────────────────────────────────────────
+ * Measures the actual elapsed time from when the board powered off at the end
+ * of the previous Bonito round (set by rendezvous_real.c) to when it woke up
+ * and cap-charged enough to reach this call.
  *
- * This file replaces charge_source_sim.c when transitioning to a real
- * energy-harvesting deployment (DISABLE_CAP_MONITOR removed, real solar/RF
- * energy source attached).
+ * The AM1805 external RTC persists across power loss; g_sleep_epoch (stored by
+ * rendezvous_real.c and included in the Riotee checkpoint) holds the POSIX
+ * epoch second at which the board last powered off.  charge_source_next() reads
+ * the RTC again and returns the difference.
  *
- * Implementation sketch
- * ─────────────────────
- * The charging time is the wall-clock duration from the end of the previous
- * round's rendezvous_wait() to when the capacitor is charged enough to run the
- * radio.  Measure it using the AM1805 persistent RTC (survives power loss):
+ * First-boot edge case: g_sleep_valid is 0 (initialised to 0, never set), so
+ * we return BONITO_INIT_MEAN — the same prior used to seed the SGD model.
  *
- *   1. At the end of each round, record the current RTC time (t_start) via
- *      riotee_am1805_read() before powering down.
- *
- *   2. On the next reset/resume, read the RTC again (t_now).
- *
- *   3. charge_source_next() returns (t_now - t_start) in seconds.
- *
- * Alternatively, if the AM1805 alarm already wakes the device, the time since
- * the alarm fire is the residual over the connection interval; the total
- * elapsed time is CI + residual.
- *
- * Relevant SDK entry points:
- *   riotee_wait_cap_charged()       runtime.c:258  — blocks until PWRGD
- *   riotee_am1805_set_alarm()       am1805.c       — set absolute RTC alarm
- *   riotee_timing_now()             riotee_timing.h — 32 kHz RTC0 ticks
- * (VOLATILE)
- *
- * NOTE: RTC0 (riotee_timing_now) is volatile and resets on power loss; the
- * AM1805 external RTC is persistent.  Use the AM1805 for cross-power-cycle
- * timing.
+ * One-round lag: the checkpoint is taken at the START of each round (before
+ * rendezvous_wait updates g_sleep_epoch).  On a power-off restore, g_sleep_epoch
+ * reflects the sleep-start from one round earlier; the error is bounded to one
+ * round's active duration (~100 ms) and the SGD is robust to it.
  */
+#include <time.h>
+
 #include "charge_source.h"
+#include "riotee_am1805.h"
+
+/* Matches bonito_dist_init() prior in main.c. */
+#define BONITO_INIT_MEAN 1.0f
+
+/* Set by rendezvous_real.c; retained globals → included in checkpoint. */
+extern time_t g_sleep_epoch;
+extern int    g_sleep_valid;
 
 float charge_source_next(void) {
-  /* TODO: implement real harvesting measurement (see comment above). */
-  return 1.0f; /* placeholder — 1 s constant */
+  struct tm now;
+  time_t t_now;
+  double elapsed;
+
+  if (!g_sleep_valid) return BONITO_INIT_MEAN;
+
+  riotee_am1805_get_datetime(&now);
+  t_now   = mktime(&now);
+  elapsed = difftime(t_now, g_sleep_epoch);
+
+  if (elapsed < 0.01) elapsed = BONITO_INIT_MEAN; /* RTC glitch guard */
+  return (float)elapsed;
 }

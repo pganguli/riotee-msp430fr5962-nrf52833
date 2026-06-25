@@ -4,53 +4,59 @@
 /*
  * BLE advertisement manufacturer payload layout for the Bonito protocol.
  *
- * This structure is placed in the BLE PDU's manufacturer-specific AD element
- * (Nordic company ID 0x0059) and has the same definition on the laptop side
- * (scan.py).  Fields are little-endian, packed.
+ * Fields are little-endian, packed, placed in the Nordic manufacturer-specific
+ * AD element (company ID 0x0059).  Definition is mirrored in scan.py.
  *
- * Budget: 31 bytes PDU - 4 bytes AD header (len + type + mfr_id) = 27 bytes
- * available.  With name_len = 0 (name AD element omitted) the full 27 bytes
- * are available for this structure.  We use 23 bytes to leave a small margin.
+ * Layout (16 bytes; fits with name="RIOTEE" and data_len ≤ 16):
  *
  *   Offset  Size  Field
  *   ------  ----  -----
- *      0      2   seq      — round index; wraps at 2^16. Used for loss
- *                           detection and for the laptop to index into the
- *                           shared charging-time trace for CI verification.
- *      2      4   ci_ms    — Bonito connection interval in milliseconds
- *                           (node's ppf(0.99) result, as announced this round).
- *      6      1   app_len  — number of valid bytes in app[];
- * 0..BONITO_ADV_APP_MAX 7    app_len  app[] — opaque application payload (u32
- * counter today, DNN inference result in the deployed version).
+ *      0      2   seq          — round index; wraps at 2^16. Loss detection.
+ *      2      1   model_type   — distribution type (BONITO_MODEL_NORMAL = 0x01)
+ *      3      1   app_len      — valid bytes in app[]; 0..BONITO_ADV_APP_MAX
+ *      4      4   mean         — Normal distribution mean (seconds, float32)
+ *      8      4   var          — Normal distribution variance (seconds², float32)
+ *     12      4   app[]        — opaque app payload (u32 counter today)
  *
- * Total: 7 + app_len bytes (≤ 23).
+ * Total: 16 bytes.
  *
- * The BLE adv_cfg.data_len should be set to (BONITO_ADV_HDR_LEN + app_len)
- * before each riotee_ble_advertise() call.
+ * The CI is NOT transmitted.  Each peer computes it independently from the
+ * received model parameters:
+ *   Always-on peer:   CI = mean + sqrt(var) * Phi^{-1}(p)           (paper §7)
+ *   Two-node Bonito:  CI = bisect(F_self(t)*F_peer(t) = p)         (paper §3.4)
+ *
+ * This mirrors the paper's Fig. 12 packet format: nodes exchange model type +
+ * parameters so each side can compute the joint CI independently.
+ *
+ * Budget: ble.c payload[31] = 3(flags)+2(name-hdr)+6("RIOTEE")+4(mfr-hdr)+data
+ * → name_len + data_len ≤ 22.  With name_len=6: data_len ≤ 16.
+ * BONITO_ADV_APP_MAX = data_len − BONITO_ADV_HDR_LEN = 16 − 12 = 4.
  */
 
 #include <stdint.h>
 
-/* Byte length of the fixed header (seq + ci_ms + app_len). */
-#define BONITO_ADV_HDR_LEN 7u
+/* Distribution type codes (paper Fig. 12 model_type byte). */
+#define BONITO_MODEL_NORMAL 0x01u
+
+/* Fixed header: seq(2) + model_type(1) + app_len(1) + mean(4) + var(4). */
+#define BONITO_ADV_HDR_LEN 12u
 
 /*
  * Maximum opaque application payload per advertisement.
- *
- * Budget (ble.c): payload[31] = 3 (flags AD) + 2 (name header) + name_len +
- *   4 (manufacturer AD header) + data_len.  Real limit: name_len+data_len ≤ 22.
- * With name="RIOTEE" (6 bytes): data_len ≤ 16.
- * BONITO_ADV_APP_MAX = data_len - BONITO_ADV_HDR_LEN = 16 - 7 = 9.
+ * 4 bytes is sufficient for a u32 counter (the default test payload).
  */
-#define BONITO_ADV_APP_MAX 9u
+#define BONITO_ADV_APP_MAX 4u
 
 /* Full structure as written into the BLE manufacturer data buffer.
- * Only the first (BONITO_ADV_HDR_LEN + app_len) bytes are transmitted. */
+ * All 16 bytes are always transmitted.
+ * mean and var land at naturally-aligned offsets (4 and 8) despite packed. */
 typedef struct {
-  uint16_t seq;                    /* round index                  */
-  uint32_t ci_ms;                  /* connection interval (ms)     */
-  uint8_t app_len;                 /* valid bytes in app[]         */
-  uint8_t app[BONITO_ADV_APP_MAX]; /* opaque app payload           */
+  uint16_t seq;                     /* round index                    */
+  uint8_t  model_type;              /* distribution type              */
+  uint8_t  app_len;                 /* valid bytes in app[]           */
+  float    mean;                    /* charging-time mean (s)         */
+  float    var;                     /* charging-time variance (s²)    */
+  uint8_t  app[BONITO_ADV_APP_MAX]; /* opaque app payload             */
 } __attribute__((packed)) bonito_adv_payload_t;
 
 #endif /* BONITO_PAYLOAD_H */

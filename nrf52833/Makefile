@@ -3,8 +3,6 @@
 # Set GNU_INSTALL_ROOT to your arm-none-eabi-gcc bin/ if it is not on PATH:
 #   make GNU_INSTALL_ROOT=/opt/gcc-arm-none-eabi/bin/ release
 #
-# DISABLE_CAP_MONITOR is always defined: under constant USB power (no harvester)
-# the startup would otherwise block forever waiting for the capacitor.
 #
 # Targets:
 #   debug    build with no optimization
@@ -17,8 +15,7 @@ GNU_INSTALL_ROOT ?=
 
 SDK_MAKE = $(MAKE) -f build.mk \
   RIOTEE_SDK_ROOT=$(RIOTEE_SDK_ROOT) \
-  GNU_INSTALL_ROOT=$(GNU_INSTALL_ROOT) \
-  USER_DEFINES=-DDISABLE_CAP_MONITOR
+  GNU_INSTALL_ROOT=$(GNU_INSTALL_ROOT)
 
 .PHONY: all debug release clean flash
 
@@ -34,4 +31,5 @@ clean:
 	$(SDK_MAKE) clean
 
 flash:
+	pyocd erase --chip -t nrf52833
 	$(SDK_MAKE) flash
