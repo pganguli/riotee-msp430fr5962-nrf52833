@@ -1,8 +1,16 @@
 # MSP430FR5962
 
 Keeps a power-cycle-persistent counter in internal FRAM and sends each value to
-the nRF52 over the C2C SPI link for BLE advertising. See [main.c](main.c) and
-the shared [protocol.h](../protocol.h).
+the nRF52 over the C2C SPI link for BLE advertising via the Bonito protocol.
+
+The C2C handoff is fire-and-forget: `c2c_send_payload(buf, len)` sends an opaque
+blob and waits only for the nRF52 SPIS ISR to latch it (~100 ms). The nRF52
+Bonito loop then broadcasts it asynchronously at the Bonito connection interval.
+
+This decoupling is intentional: the MSP430 (or a DNN inference loop in another
+repo) can produce payloads at its own cadence without blocking on the radio.
+
+See [main.c](main.c) and the shared [protocol.h](../protocol.h).
 
 ## Build and flash
 

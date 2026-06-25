@@ -2,36 +2,47 @@
  * MSP430FR5962 application firmware (Riotee board).
  *
  * Maintains a power-cycle-persistent counter in internal FRAM and hands each
- * value to the nRF52833 over the inter-chip (C2C) SPI link for BLE advertising:
+ * value to the nRF52833 over the inter-chip (C2C) SPI link for BLE advertising
+ * via the Bonito protocol.
  *
+ * Flow:
  *   1. On boot, read the last committed counter from FRAM (0 if never set).
- *   2. Increment (in RAM, not yet committed).
- *   3. Send the value to the nRF52 and wait for its "advertising done" signal.
- *   4. On done, commit the new value to FRAM, then go to step 2.
+ *   2. Increment the counter (in RAM, not yet committed to FRAM).
+ *   3. Send the value to the nRF52 with c2c_send_payload() and wait for
+ *      C2C_STATUS_ACCEPTED — the nRF52's SPIS ISR latches the payload within
+ *      a few hundred microseconds and replies ACCEPTED on the next poll tick
+ *      (~100 ms). The nRF52 Bonito loop broadcasts it asynchronously.
+ *   4. On ACCEPTED: commit to FRAM, wait ~80 ms (human-visible LED gap),
+ * repeat.
  *
- * If the nRF52 never confirms, a 3 s timer expires and the value is re-sent.
+ * This design is intentionally decoupled from the Bonito timing: the MSP430
+ * increments the counter as fast as the ACCEPTED acknowledgement allows
+ * (roughly one value per 100-200 ms), while the nRF52 broadcasts at the Bonito
+ * connection interval (roughly 0.7-1.5 s). The nRF52 keeps the latest value
+ * (latest-wins), so some counter values may be skipped in the BLE output.
+ *
+ * DNN integration:
+ *   c2c_send_payload(buf, len) is the ONLY function the DNN repo needs to call.
+ *   Replace the counter increment below with your inference result and pass it
+ *   as buf/len.  The nRF52 and the C2C protocol are entirely agnostic to the
+ *   payload content (up to C2C_MAX_PAYLOAD = 16 bytes).
  *
  * Roles: the MSP430 is the SPI master (eUSCI_A0); the nRF52 is the SPI slave
- * exposing a status register. The master pushes the counter, then polls the
+ * exposing a status register. The master pushes the payload, then polls the
  * status (poll cadence paced by a Timer_A interrupt, CPU in LPM3 between
  * polls).
  *
- * LED feedback (PJ.0, shared with the nRF52 - the nRF52 firmware must leave it
+ * LED feedback (PJ.0, shared with the nRF52 — the nRF52 firmware must leave it
  * alone):
- *   - first boot after programming (counter reset to 0): 30 rapid blinks
- *   - restored value after a power cycle/reset:           3 rapid blinks
- *   - while a value is out for advertising:                LED on
- *   - confirmation received:                               LED off
- *   - 3 s timeout:                                         3 rapid blinks, then
+ *   - First boot after programming (counter reset to 0):  30 rapid blinks
+ *   - Restored value after a power cycle/reset:            3 rapid blinks
+ *   - While a value is out for handoff:                    LED on
+ *   - ACCEPTED received (nRF52 latched the payload):       LED off
+ *   - 3 s timeout without ACCEPTED (nRF52 unresponsive):   3 rapid blinks,
  * retry
  *
- * All steady-state signal/timer handling is interrupt-driven; the CPU sleeps in
- * LPM3 (or LPM0 during the brief SPI byte shifts) whenever it has nothing to
- * do.
- *
  * C2C pin mapping (eUSCI_A0, secondary module function SEL=10):
- *   UCA0SIMO = P2.0, UCA0SOMI = P2.1, UCA0CLK = P1.5, chip-select = P1.4
- * (GPIO).
+ *   UCA0SIMO = P2.0, UCA0SOMI = P2.1, UCA0CLK = P1.5, chip-select = P1.4 (GPIO)
  */
 #include <msp430.h>
 #include <stdint.h>
@@ -46,12 +57,12 @@
 
 /* Timer_A runs from ACLK = VLOCLK (~9.4 kHz internal low-power oscillator).
  * The exact VLO frequency varies, but only coarse timing is needed here. */
-#define POLL_TICKS 940u   /* ~100 ms status-poll cadence            */
-#define TIMEOUT_POLLS 30u /* 30 * ~100 ms ~= 3 s without a DONE      */
+#define POLL_TICKS 940u   /* ~100 ms status-poll cadence                */
+#define TIMEOUT_POLLS 30u /* 30 × ~100 ms ~= 3 s without an ACCEPTED   */
 
 /* FRAM-resident, retained across resets and power cycles. */
 #pragma PERSISTENT(g_counter)
-counter_t g_counter = 0;
+uint32_t g_counter = 0;
 #pragma PERSISTENT(g_initialized)
 uint16_t g_initialized = 0;
 
@@ -71,7 +82,7 @@ static void clock_init(void) {
 static void led_on(void) { PJOUT |= LED_BIT; }
 static void led_off(void) { PJOUT &= ~LED_BIT; }
 
-/* Boot-time visual feedback only - a brief busy delay here is acceptable. */
+/* Boot-time visual feedback only — a brief busy delay here is acceptable. */
 static void blink_rapid(uint8_t n) {
   uint8_t i;
   for (i = 0; i < n; i++) {
@@ -95,11 +106,11 @@ static void spi_init(void) {
   P1SEL1 |= BIT5;
 
   UCA0CTLW0 = UCSWRST; /* hold eUSCI in reset */
-  /* SPI master, synchronous, MSB first, mode 0 (CPOL=0 -> UCCKPL=0, CPHA=0 ->
-   * UCCKPH=1). */
+  /* SPI master, synchronous, MSB first, mode 0 (CPOL=0 → UCCKPL=0,
+   * CPHA=0 → UCCKPH=1). */
   UCA0CTLW0 |= UCMST | UCSYNC | UCMSB | UCCKPH | UCSSEL__SMCLK;
   UCA0BRW = 16;          /* ~1 MHz / 16 ~ 62.5 kHz */
-  UCA0CTLW0 &= ~UCSWRST; /* release for operation */
+  UCA0CTLW0 &= ~UCSWRST; /* release for operation   */
 }
 
 static void timer_init(void) {
@@ -120,31 +131,51 @@ static uint8_t spi_xfer(uint8_t tx) {
   return spi_rx;
 }
 
-/* Run one fixed-length C2C transaction; returns the status byte (response byte
- * 0). */
-static uint8_t c2c_txn(uint8_t cmd, counter_t value) {
+/*
+ * Send an opaque payload to the nRF52 via C2C and return the response status.
+ *
+ * Frame layout: [C2C_CMD_SET_PAYLOAD][len][b0..b_{len-1}][pad to C2C_FRAME_LEN]
+ *
+ * This is the function the DNN repo should call:
+ *   c2c_send_payload((uint8_t *)&result, sizeof(result));
+ *
+ * Returns the status byte clocked back in the first response byte.
+ */
+static uint8_t c2c_send_payload(const uint8_t* buf, uint8_t len) {
   uint8_t frame[C2C_FRAME_LEN];
   uint8_t status;
   uint8_t i;
 
-  frame[0] = cmd;
-  frame[1] = (uint8_t)(value);
-  frame[2] = (uint8_t)(value >> 8);
-  frame[3] = (uint8_t)(value >> 16);
-  frame[4] = (uint8_t)(value >> 24);
-  frame[5] = 0;
+  if (len > C2C_MAX_PAYLOAD) len = C2C_MAX_PAYLOAD;
+
+  frame[0] = C2C_CMD_SET_PAYLOAD;
+  frame[1] = len;
+  for (i = 0; i < len; i++) frame[2 + i] = buf[i];
+  for (i = len; i < C2C_MAX_PAYLOAD; i++) frame[2 + i] = 0; /* pad */
 
   P1OUT &= ~CS_BIT; /* assert chip-select */
   __delay_cycles(20);
-  status =
-      spi_xfer(frame[0]); /* status comes back while we clock out the command */
+  status = spi_xfer(frame[0]);
   for (i = 1; i < C2C_FRAME_LEN; i++) spi_xfer(frame[i]);
   P1OUT |= CS_BIT; /* release chip-select */
   return status;
 }
 
+/* Poll the nRF52 status register (GET_STATUS transaction). */
+static uint8_t c2c_get_status(void) {
+  uint8_t status;
+  uint8_t i;
+
+  P1OUT &= ~CS_BIT;
+  __delay_cycles(20);
+  status = spi_xfer(C2C_CMD_GET_STATUS);
+  for (i = 1; i < C2C_FRAME_LEN; i++) spi_xfer(0);
+  P1OUT |= CS_BIT;
+  return status;
+}
+
 int main(void) {
-  counter_t working;
+  uint32_t working;
   uint8_t status;
   uint16_t polls;
 
@@ -180,20 +211,19 @@ int main(void) {
     status = C2C_STATUS_IDLE;
     for (;;) { /* (re)send-and-wait loop */
       led_on();
-      c2c_txn(C2C_CMD_SET_COUNTER, working);
+      c2c_send_payload((const uint8_t*)&working, sizeof(working));
 
       polls = 0;
-      for (;;) { /* poll for completion, sleeping between ticks */
+      for (;;) { /* poll for ACCEPTED, sleeping between ticks */
         timer_tick = 0;
         while (!timer_tick) __bis_SR_register(LPM3_bits | GIE);
 
-        status = c2c_txn(C2C_CMD_GET_STATUS, 0);
-        if (status == C2C_STATUS_DONE) break;
-        if (++polls >= TIMEOUT_POLLS)
-          break; /* 3 s elapsed without confirmation */
+        status = c2c_get_status();
+        if (status == C2C_STATUS_ACCEPTED) break;
+        if (++polls >= TIMEOUT_POLLS) break; /* ~3 s without ACCEPTED */
       }
 
-      if (status == C2C_STATUS_DONE) {
+      if (status == C2C_STATUS_ACCEPTED) {
         led_off();
         g_counter = working;   /* commit to FRAM (write is immediate) */
         __delay_cycles(80000); /* ~80 ms gap so the off is human-visible */
